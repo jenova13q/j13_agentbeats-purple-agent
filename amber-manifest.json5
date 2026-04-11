@@ -5,18 +5,11 @@
   config_schema: {
     type: "object",
     properties: {
-      llm_model: { type: "string", default: "gpt-4.1-mini" },
+      llm_model: { type: "string", default: "gpt-5-mini" },
       openai_api_key: { type: "string", secret: true },
-      gemini_api_key: { type: "string", secret: true },
-      openrouter_api_key: { type: "string", secret: true },
     },
     required: [],
     additionalProperties: false,
-  },
-
-  // External services this agent can call.
-  slots: {
-    proxy: { kind: "a2a", optional: true },
   },
 
   // Runtime configuration.
@@ -28,8 +21,6 @@
     env: {
       LLM_MODEL: "${config.llm_model}",
       OPENAI_API_KEY: "${config.openai_api_key}",
-      GEMINI_API_KEY: "${config.gemini_api_key}",
-      OPENROUTER_API_KEY: "${config.openrouter_api_key}",
     },
 
     network: {

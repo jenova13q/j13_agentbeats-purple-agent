@@ -1,0 +1,12 @@
+{
+  "challenger_url": "http://localhost:9009/",
+  "challenger_label": "j13",
+  "games": 10,
+  "max_rounds": 5,
+  "discount": 0.98,
+  "bootstrap": 25,
+  "challenger_circle": 6,
+  "model": "nfsp",
+  "circle": 0,
+  "full_matrix": false
+}
