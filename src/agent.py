@@ -41,6 +41,11 @@ Rules:
 """
 
 
+def _uses_max_completion_tokens(model: str) -> bool:
+    lowered = (model or "").lower()
+    return lowered.startswith("gpt-5") or lowered.startswith("gpt-5.")
+
+
 @dataclass
 class NegotiationState:
     offers_to_other_by_game: dict[int, list[list[int]]] = field(default_factory=dict)
@@ -363,15 +368,20 @@ Do not return explanations.
             user_prompt = self._prepare_context(obs)
             if catalog and top_options:
                 user_prompt = self._prepare_catalog_context(obs, catalog, top_options)
-            response = self.client.chat.completions.create(
-                model=self.model,
-                temperature=0.2,
-                max_tokens=300,
-                messages=[
+            request_kwargs = {
+                "model": self.model,
+                "temperature": 0.2,
+                "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
-            )
+            }
+            if _uses_max_completion_tokens(self.model):
+                request_kwargs["max_completion_tokens"] = 300
+            else:
+                request_kwargs["max_tokens"] = 300
+
+            response = self.client.chat.completions.create(**request_kwargs)
             content = response.choices[0].message.content or ""
             logger.warning("LLM call succeeded for PROPOSE.")
             return self._extract_json_from_text(content.strip())
