@@ -43,7 +43,14 @@ Rules:
 
 def _uses_max_completion_tokens(model: str) -> bool:
     lowered = (model or "").lower()
-    return lowered.startswith("gpt-5") or lowered.startswith("gpt-5.")
+    # OpenAI reasoning families and GPT-5 use max_completion_tokens instead of max_tokens.
+    return (
+        lowered.startswith("gpt-5")
+        or lowered.startswith("gpt-5.")
+        or lowered.startswith("o1")
+        or lowered.startswith("o3")
+        or lowered.startswith("o4")
+    )
 
 
 @dataclass
