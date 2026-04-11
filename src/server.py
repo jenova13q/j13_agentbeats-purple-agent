@@ -1,4 +1,5 @@
 import argparse
+import logging
 import uvicorn
 
 from a2a.server.apps import A2AStarletteApplication
@@ -11,6 +12,12 @@ from a2a.types import (
 )
 
 from executor import Executor
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 
 def main():

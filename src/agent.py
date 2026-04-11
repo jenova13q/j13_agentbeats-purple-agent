@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -14,6 +15,9 @@ try:
     from openai import OpenAI
 except ImportError:  # pragma: no cover - dependency may be absent locally
     OpenAI = None
+
+
+logger = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = """You are a negotiation agent for an item-allocation game.
@@ -41,8 +45,15 @@ class Agent:
     def __init__(self):
         self.messenger = Messenger()
         self.state = NegotiationState()
-        self.model = os.environ.get("MODEL") or "gpt-4.1-mini"
+        self.model = os.environ.get("LLM_MODEL") or os.environ.get("MODEL") or "gpt-4.1-mini"
         self.client = self._init_client()
+        logger.warning(
+            "Purple agent LLM config: client_enabled=%s model=%s openai_key=%s openrouter_key=%s",
+            self.client is not None,
+            self.model,
+            bool(os.environ.get("OPENAI_API_KEY")),
+            bool(os.environ.get("OPENROUTER_API_KEY")),
+        )
 
     def _init_client(self):
         if OpenAI is None:
@@ -196,9 +207,11 @@ Do not return explanations.
 
     def _call_llm_for_offer(self, obs: dict[str, Any]) -> dict[str, Any] | None:
         if self.client is None:
+            logger.warning("LLM disabled for PROPOSE; using fallback policy.")
             return None
 
         try:
+            logger.warning("Calling LLM for PROPOSE with model=%s", self.model)
             response = self.client.chat.completions.create(
                 model=self.model,
                 temperature=0.2,
@@ -209,8 +222,10 @@ Do not return explanations.
                 ],
             )
             content = response.choices[0].message.content or ""
+            logger.warning("LLM call succeeded for PROPOSE.")
             return self._extract_json_from_text(content.strip())
-        except Exception:
+        except Exception as exc:
+            logger.exception("LLM call failed for PROPOSE: %s", exc)
             return None
 
     def _validate_offer(
@@ -292,6 +307,7 @@ Do not return explanations.
                     "allocation_other": allocation_other,
                 }
 
+        logger.warning("Falling back to deterministic proposal policy.")
         fallback = self._compute_rule_based_offer(
             quantities, valuations_self, batna_self, round_index, max_rounds
         )
