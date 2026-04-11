@@ -1,0 +1,47 @@
+{
+  manifest_version: "0.1.0",
+
+  // AgentBeats deploy-time configuration.
+  config_schema: {
+    type: "object",
+    properties: {
+      model: { type: "string", default: "baseline-rule-agent" },
+      openai_api_key: { type: "string", secret: true },
+      gemini_api_key: { type: "string", secret: true },
+      openrouter_api_key: { type: "string", secret: true },
+    },
+    required: [],
+    additionalProperties: false,
+  },
+
+  // External services this agent can call.
+  slots: {
+    proxy: { kind: "a2a", optional: true },
+  },
+
+  // Runtime configuration.
+  program: {
+    // Replace this with the published public image before registration.
+    image: "ghcr.io/jenova13q/j13_agentbeats-purple-agent:latest",
+    entrypoint: "uv run python src/server.py --host 0.0.0.0 --port 9009",
+
+    env: {
+      MODEL: "${config.model}",
+      OPENAI_API_KEY: "${config.openai_api_key}",
+      GEMINI_API_KEY: "${config.gemini_api_key}",
+      OPENROUTER_API_KEY: "${config.openrouter_api_key}",
+    },
+
+    network: {
+      endpoints: [
+        { name: "a2a_endpoint", port: 9009 },
+      ],
+    },
+  },
+
+  provides: {
+    a2a: { kind: "a2a", endpoint: "a2a_endpoint" },
+  },
+
+  exports: { a2a: "a2a" },
+}
