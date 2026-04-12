@@ -79,6 +79,7 @@ class NegotiationState:
     incoming_offers_to_self_by_game: dict[int, list[list[int]]] = field(default_factory=dict)
     best_incoming_value_by_game: dict[int, int] = field(default_factory=dict)
     best_incoming_offer_to_self_by_game: dict[int, list[int]] = field(default_factory=dict)
+    negotiation_mode_by_game: dict[int, str] = field(default_factory=dict)
 
 
 class Agent:
@@ -260,6 +261,74 @@ class Agent:
             return "flexible"
         return "steady"
 
+    def _choose_negotiation_mode(
+        self,
+        game_index: int,
+        round_index: int,
+        max_rounds: int,
+        opponent_style: str,
+        best_incoming_value: int,
+        max_value: int,
+    ) -> str:
+        if round_index >= max_rounds - 1:
+            if opponent_style in {"tough", "steady"}:
+                mode = "close_safe"
+            elif best_incoming_value >= max(1, int(max_value * 0.55)):
+                mode = "close_safe"
+            else:
+                mode = "nash_balanced"
+        elif opponent_style == "flexible":
+            mode = "value_max"
+        elif opponent_style in {"tough", "steady"}:
+            mode = "nash_balanced"
+        else:
+            mode = "nash_balanced"
+
+        self.state.negotiation_mode_by_game[game_index] = mode
+        return mode
+
+    def _mode_adjustments(self, mode: str) -> dict[str, float]:
+        if mode == "value_max":
+            return {
+                "my_value_weight": 0.28,
+                "fairness_scale": 0.80,
+                "close_bonus": 0.85,
+                "accept_epsilon": 0.99,
+            }
+        if mode == "close_safe":
+            return {
+                "my_value_weight": 0.18,
+                "fairness_scale": 1.20,
+                "close_bonus": 1.20,
+                "accept_epsilon": 0.95,
+            }
+        return {
+            "my_value_weight": 0.22,
+            "fairness_scale": 1.00,
+            "close_bonus": 1.00,
+            "accept_epsilon": 0.97,
+        }
+
+    def _project_next_round_value(
+        self,
+        quantities: list[int],
+        valuations_self: list[int],
+        batna_self: int,
+        round_index: int,
+        max_rounds: int,
+    ) -> int:
+        next_round = min(round_index + 1, max_rounds)
+        projected = self._compute_rule_based_offer(
+            quantities,
+            valuations_self,
+            batna_self,
+            next_round,
+            max_rounds,
+        )
+        if projected is None:
+            return batna_self
+        return self._calculate_value(projected[0], valuations_self)
+
     def _fairness_adjustment(
         self,
         my_value: int,
@@ -338,6 +407,7 @@ Do not return explanations.
         max_rounds: int,
         previous_offer_to_other: list[int] | None = None,
         opponent_style: str = "unknown",
+        negotiation_mode: str = "nash_balanced",
     ) -> float:
         my_value = self._calculate_value(allocation_self, valuations_self)
         if my_value < batna_self:
@@ -359,6 +429,8 @@ Do not return explanations.
             target_value,
             opponent_style,
         )
+        mode_adjustments = self._mode_adjustments(negotiation_mode)
+        fairness_adjustment *= mode_adjustments["fairness_scale"]
         extreme_penalty = 0.0
         if all(x == 0 for x in allocation_self) or all(x == 0 for x in allocation_other):
             extreme_penalty += 200.0
@@ -377,7 +449,7 @@ Do not return explanations.
 
         return (
             nash_proxy
-            + 0.22 * my_value
+            + mode_adjustments["my_value_weight"] * my_value
             + fairness_adjustment
             - closeness_penalty
             - concession_penalty
@@ -394,6 +466,7 @@ Do not return explanations.
         max_rounds: int,
         previous_offer_to_other: list[int] | None = None,
         opponent_style: str = "unknown",
+        negotiation_mode: str = "nash_balanced",
     ) -> dict[str, Any] | None:
         best_option = None
         best_score = float("-inf")
@@ -426,6 +499,7 @@ Do not return explanations.
                 max_rounds,
                 previous_offer_to_other=previous_offer_to_other,
                 opponent_style=opponent_style,
+                negotiation_mode=negotiation_mode,
             )
             if score > best_score:
                 best_score = score
@@ -470,6 +544,7 @@ Do not return explanations.
         max_rounds: int,
         best_incoming_value: int = 0,
         opponent_style: str = "unknown",
+        negotiation_mode: str = "nash_balanced",
     ) -> dict[str, Any] | None:
         if not scored_options:
             return None
@@ -478,6 +553,7 @@ Do not return explanations.
             return None
 
         few_options = len(scored_options) <= 3
+        mode_adjustments = self._mode_adjustments(negotiation_mode)
         floor_multiplier = 1.02
         if opponent_style in {"tough", "steady"} or few_options:
             floor_multiplier = 1.00
@@ -516,7 +592,12 @@ Do not return explanations.
                 target_value,
                 opponent_style,
             )
-            close_score = their_proxy * 0.9 - abs(my_value - target_value) * 0.03 + option["score"] * 0.18
+            fairness_adjustment *= mode_adjustments["fairness_scale"]
+            close_score = (
+                their_proxy * (0.9 * mode_adjustments["close_bonus"])
+                - abs(my_value - target_value) * 0.03
+                + option["score"] * 0.18
+            )
             close_score += fairness_adjustment * 0.7
             if close_score > best_close_score:
                 best_close_score = close_score
@@ -617,9 +698,25 @@ Do not return explanations.
         max_value = self._calculate_value(quantities, valuations_self)
         target_value = self._target_value(max_value, batna_self, round_index, max_rounds)
         opponent_style = self._infer_opponent_style(game_index, valuations_self, max_value)
+        negotiation_mode = self._choose_negotiation_mode(
+            game_index,
+            round_index,
+            max_rounds,
+            opponent_style,
+            best_seen,
+            max_value,
+        )
+        mode_adjustments = self._mode_adjustments(negotiation_mode)
         final_offer = self._compute_rule_based_offer(quantities, valuations_self, batna_self, max_rounds, max_rounds)
         final_offer_value = (
             self._calculate_value(final_offer[0], valuations_self) if final_offer is not None else discounted_batna
+        )
+        next_round_value = self._project_next_round_value(
+            quantities,
+            valuations_self,
+            batna_self,
+            round_index,
+            max_rounds,
         )
 
         if round_index >= max_rounds:
@@ -635,6 +732,14 @@ Do not return explanations.
             threshold = min(threshold, max(discounted_batna, best_seen * 0.99, target_value * 0.54))
         if round_index >= max_rounds - 1 and value >= best_seen and value >= discounted_batna:
             threshold = min(threshold, value)
+        if round_index >= max_rounds - 1:
+            threshold = min(
+                threshold,
+                max(
+                    discounted_batna,
+                    next_round_value * mode_adjustments["accept_epsilon"],
+                ),
+            )
 
         if value >= threshold:
             return {"action": "ACCEPT"}
@@ -654,6 +759,14 @@ Do not return explanations.
         best_incoming_value = self.state.best_incoming_value_by_game.get(game_index, 0)
         max_value = self._calculate_value(quantities, valuations_self)
         opponent_style = self._infer_opponent_style(game_index, valuations_self, max_value)
+        negotiation_mode = self._choose_negotiation_mode(
+            game_index,
+            round_index,
+            max_rounds,
+            opponent_style,
+            best_incoming_value,
+            max_value,
+        )
 
         best_catalog = None
         top_options: list[dict[str, Any]] = []
@@ -670,6 +783,7 @@ Do not return explanations.
                     max_rounds,
                     previous_offer_to_other=previous_offer_to_other,
                     opponent_style=opponent_style,
+                    negotiation_mode=negotiation_mode,
                 )
                 if best is not None:
                     scored.append(best)
@@ -685,11 +799,13 @@ Do not return explanations.
                     max_rounds,
                     best_incoming_value=best_incoming_value,
                     opponent_style=opponent_style,
+                    negotiation_mode=negotiation_mode,
                 )
                 logger.warning(
-                    "Catalog parsed with %s valid options; style=%s best_choice_id=%s best_score=%.2f",
+                    "Catalog parsed with %s valid options; style=%s mode=%s best_choice_id=%s best_score=%.2f",
                     len(scored),
                     opponent_style,
+                    negotiation_mode,
                     best_catalog.get("choice_id"),
                     best_catalog.get("score", float("-inf")),
                 )
