@@ -65,7 +65,9 @@ def _uses_max_completion_tokens(model: str) -> bool:
 class NegotiationState:
     offers_to_other_by_game: dict[int, list[list[int]]] = field(default_factory=dict)
     offers_to_self_by_game: dict[int, list[list[int]]] = field(default_factory=dict)
+    incoming_offers_to_self_by_game: dict[int, list[list[int]]] = field(default_factory=dict)
     best_incoming_value_by_game: dict[int, int] = field(default_factory=dict)
+    best_incoming_offer_to_self_by_game: dict[int, list[int]] = field(default_factory=dict)
 
 
 class Agent:
@@ -386,6 +388,53 @@ Do not return explanations.
             + "\n".join(option_lines)
         )
 
+    def _select_close_catalog_option(
+        self,
+        scored_options: list[dict[str, Any]],
+        valuations_self: list[int],
+        batna_self: int,
+        round_index: int,
+        max_rounds: int,
+        best_incoming_value: int = 0,
+    ) -> dict[str, Any] | None:
+        if not scored_options:
+            return None
+
+        if round_index < max_rounds - 1:
+            return None
+
+        close_floor = max(batna_self, int(best_incoming_value * 1.02))
+        best_close = None
+        best_close_score = float("-inf")
+        for option in scored_options:
+            my_value = self._calculate_value(option["allocation_self"], valuations_self)
+            if my_value < close_floor:
+                continue
+
+            their_proxy = max(
+                self._calculate_value(
+                    [a + b for a, b in zip(option["allocation_self"], option["allocation_other"])],
+                    valuations_self,
+                )
+                - my_value,
+                0,
+            )
+            target_value = self._target_value(
+                self._calculate_value(
+                    [a + b for a, b in zip(option["allocation_self"], option["allocation_other"])],
+                    valuations_self,
+                ),
+                batna_self,
+                round_index,
+                max_rounds,
+            )
+            close_score = their_proxy * 0.8 - abs(my_value - target_value) * 0.04 + option["score"] * 0.2
+            if close_score > best_close_score:
+                best_close_score = close_score
+                best_close = option
+
+        return best_close
+
     def _call_llm_for_offer(
         self,
         obs: dict[str, Any],
@@ -468,17 +517,24 @@ Do not return explanations.
         if not offered_self:
             return {"action": "WALK", "reason": "bad_pending_offer"}
 
+        self.state.incoming_offers_to_self_by_game.setdefault(game_index, []).append(list(offered_self))
         value = self._calculate_value(offered_self, valuations_self)
         best_seen = max(value, self.state.best_incoming_value_by_game.get(game_index, 0))
         self.state.best_incoming_value_by_game[game_index] = best_seen
+        if value >= best_seen:
+            self.state.best_incoming_offer_to_self_by_game[game_index] = list(offered_self)
         discounted_batna = batna_self * (discount ** max(round_index - 1, 0))
         max_value = self._calculate_value(quantities, valuations_self)
         target_value = self._target_value(max_value, batna_self, round_index, max_rounds)
+        final_offer = self._compute_rule_based_offer(quantities, valuations_self, batna_self, max_rounds, max_rounds)
+        final_offer_value = (
+            self._calculate_value(final_offer[0], valuations_self) if final_offer is not None else discounted_batna
+        )
 
         if round_index >= max_rounds:
-            threshold = max(discounted_batna, best_seen * 0.92, target_value * 0.55)
+            threshold = max(discounted_batna, min(best_seen, final_offer_value))
         elif round_index >= max_rounds - 1:
-            threshold = max(discounted_batna, best_seen * 0.96, target_value * 0.65)
+            threshold = max(discounted_batna, best_seen * 0.97, final_offer_value * 0.92, target_value * 0.62)
         elif round_index > 1:
             threshold = max(discounted_batna, target_value * 0.78)
         else:
@@ -499,9 +555,11 @@ Do not return explanations.
         catalog = self._parse_allocation_catalog(raw_message)
         previous_offers = self.state.offers_to_other_by_game.get(game_index, [])
         previous_offer_to_other = previous_offers[-1] if previous_offers else None
+        best_incoming_value = self.state.best_incoming_value_by_game.get(game_index, 0)
 
         best_catalog = None
         top_options: list[dict[str, Any]] = []
+        close_catalog = None
         if catalog:
             scored = []
             for option in catalog:
@@ -520,6 +578,14 @@ Do not return explanations.
             if scored:
                 best_catalog = scored[0]
                 top_options = scored[: min(5, len(scored))]
+                close_catalog = self._select_close_catalog_option(
+                    scored,
+                    valuations_self,
+                    batna_self,
+                    round_index,
+                    max_rounds,
+                    best_incoming_value=best_incoming_value,
+                )
                 logger.warning(
                     "Catalog parsed with %s valid options; best_choice_id=%s best_score=%.2f",
                     len(scored),
@@ -559,6 +625,18 @@ Do not return explanations.
                     "allocation_self": allocation_self,
                     "allocation_other": allocation_other,
                 }
+
+        if close_catalog is not None:
+            allocation_self = close_catalog["allocation_self"]
+            allocation_other = close_catalog["allocation_other"]
+            self.state.offers_to_other_by_game.setdefault(game_index, []).append(allocation_other)
+            self.state.offers_to_self_by_game.setdefault(game_index, []).append(allocation_self)
+            logger.warning("Using close-oriented catalog option with choice_id=%s", close_catalog.get("choice_id"))
+            return {
+                "choice_id": close_catalog.get("choice_id"),
+                "allocation_self": allocation_self,
+                "allocation_other": allocation_other,
+            }
 
         if best_catalog is not None:
             allocation_self = best_catalog["allocation_self"]
