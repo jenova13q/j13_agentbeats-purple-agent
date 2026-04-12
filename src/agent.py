@@ -31,12 +31,20 @@ If a catalog is present, return:
 Otherwise, return:
 {"allocation_self": [int, ...], "allocation_other": [int, ...]}
 
+Primary objective:
+- maximize a closeable Nash-style deal
+- good deals improve your value above BATNA while still leaving the opponent with a meaningful share
+- a slightly less greedy accepted deal is better than a rejected extreme deal
+
+Strategy:
+- keep the items you value most
+- give up items you value least first
+- start near the suggested target, then make small monotonic concessions
+- in the last round, prefer a closeable deal over a greedy dead-end
+
 Rules:
 - allocation_self[i] + allocation_other[i] must equal quantities[i]
 - all values must be non-negative integers
-- prefer deals where your own value stays above BATNA
-- start firm, then make small concessions if needed
-- keep higher-value items for yourself when possible
 - if valid catalog options are provided, prefer the best catalog choice over inventing a new split
 """
 
@@ -57,6 +65,7 @@ def _uses_max_completion_tokens(model: str) -> bool:
 class NegotiationState:
     offers_to_other_by_game: dict[int, list[list[int]]] = field(default_factory=dict)
     offers_to_self_by_game: dict[int, list[list[int]]] = field(default_factory=dict)
+    best_incoming_value_by_game: dict[int, int] = field(default_factory=dict)
 
 
 class Agent:
@@ -178,16 +187,8 @@ class Agent:
         allocation_self = [0] * len(quantities)
         allocation_other = list(quantities)
 
-        progress = round_index / max(max_rounds, 1)
-        if progress < 0.34:
-            target_ratio = 0.82
-        elif progress < 0.67:
-            target_ratio = 0.72
-        else:
-            target_ratio = 0.62
-
         max_value = self._calculate_value(quantities, valuations_self)
-        target_value = max(batna_self, int(max_value * target_ratio))
+        target_value = self._target_value(max_value, batna_self, round_index, max_rounds)
 
         for index in item_order:
             while allocation_other[index] > 0 and self._calculate_value(allocation_self, valuations_self) < target_value:
@@ -209,15 +210,21 @@ class Agent:
 
         return allocation_self, allocation_other
 
-    def _target_ratio(self, round_index: int, max_rounds: int) -> float:
+    def _target_surplus_ratio(self, round_index: int, max_rounds: int) -> float:
         progress = round_index / max(max_rounds, 1)
-        if progress < 0.25:
-            return 0.86
-        if progress < 0.5:
-            return 0.78
-        if progress < 0.8:
-            return 0.7
-        return 0.62
+        if progress <= 0.2:
+            return 0.50
+        if progress <= 0.4:
+            return 0.44
+        if progress <= 0.6:
+            return 0.38
+        if progress <= 0.8:
+            return 0.30
+        return 0.20
+
+    def _target_value(self, max_value: int, batna_self: int, round_index: int, max_rounds: int) -> int:
+        surplus = max(max_value - batna_self, 0)
+        return max(batna_self, int(batna_self + surplus * self._target_surplus_ratio(round_index, max_rounds)))
 
     def _prepare_context(self, obs: dict[str, Any]) -> str:
         quantities = obs.get("quantities", [])
@@ -226,25 +233,40 @@ class Agent:
         round_index = obs.get("round_index", 1)
         max_rounds = obs.get("max_rounds", 5)
         game_index = obs.get("game_index", 0)
+        discount = obs.get("discount", 1.0)
+        max_value = self._calculate_value(quantities, valuations_self)
+        target_value = self._target_value(max_value, batna_self, round_index, max_rounds)
+        discounted_batna = batna_self * (discount ** max(round_index - 1, 0))
+        ranking = sorted(range(len(valuations_self)), key=lambda i: valuations_self[i], reverse=True)
 
         history = self.state.offers_to_other_by_game.get(game_index, [])
         history_text = ""
         if history:
             history_text = "\nPrevious offers to opponent:\n"
             for idx, offer in enumerate(history[-3:], 1):
-                history_text += f"- Offer {idx}: allocation_other={offer}\n"
+                my_side = self._self_from_other(offer, quantities)
+                my_value = self._calculate_value(my_side, valuations_self)
+                history_text += f"- Offer {idx}: gave={offer}, kept={my_side}, my_value={my_value}\n"
 
         return f"""Game state:
 - quantities: {quantities}
 - my valuations: {valuations_self}
 - my BATNA: {batna_self}
+- my discounted BATNA now: {discounted_batna:.1f}
+- my maximum possible value: {max_value}
 - round: {round_index} of {max_rounds}
-- target utility ratio this round: {self._target_ratio(round_index, max_rounds):.2f}
+- target value this round: about {target_value}
+- item priority for me: {ranking}
 {history_text}
 
 Return one valid JSON proposal only.
-Prefer keeping more of the higher-valued items.
-Do not make the opponent's deal strictly worse than your last serious proposal unless needed for validity.
+Aim for a closeable Nash-style deal:
+- stay above BATNA
+- keep more of the higher-valued items
+- give up lower-valued items first
+- avoid extreme all-or-nothing splits
+- make small monotonic concessions across rounds
+If a catalog is present, prefer a choice_id from the catalog.
 Do not return explanations.
 """
 
@@ -267,11 +289,15 @@ Do not return explanations.
             valuations_self,
         )
         their_proxy = max(total_value - my_value, 0)
-        fairness_penalty = abs(my_value - their_proxy) * 0.05
-
-        target_ratio = self._target_ratio(round_index, max_rounds)
-        target_value = max(batna_self, total_value * target_ratio)
-        closeness_penalty = abs(my_value - target_value) * 0.08
+        my_surplus = max(my_value - batna_self, 0)
+        target_value = self._target_value(total_value, batna_self, round_index, max_rounds)
+        closeness_penalty = abs(my_value - target_value) * 0.06
+        nash_proxy = my_surplus * (their_proxy + 1)
+        extreme_penalty = 0.0
+        if all(x == 0 for x in allocation_self) or all(x == 0 for x in allocation_other):
+            extreme_penalty += 200.0
+        if sum(1 for x in allocation_other if x == 0) >= max(1, len(allocation_other) - 1):
+            extreme_penalty += 60.0
 
         concession_penalty = 0.0
         if previous_offer_to_other is not None:
@@ -283,7 +309,7 @@ Do not return explanations.
             )
             concession_penalty = 0.75 * give_back + 0.2 * abrupt_concession
 
-        return my_value + 0.42 * their_proxy - fairness_penalty - closeness_penalty - concession_penalty
+        return nash_proxy + 0.25 * my_value - closeness_penalty - concession_penalty - extreme_penalty
 
     def _best_catalog_option(
         self,
@@ -354,7 +380,7 @@ Do not return explanations.
         return (
             f"{base}\n"
             "Allocation catalog is available. Choose one of the valid catalog options below.\n"
-            "Prefer options that keep your utility above BATNA while staying reasonably balanced.\n"
+            "Prefer a closeable Nash-style option: strong for you, but not so extreme that it is likely to be rejected.\n"
             "Return JSON only in the form {\"choice_id\": <int>}.\n"
             "Top candidate options:\n"
             + "\n".join(option_lines)
@@ -435,21 +461,28 @@ Do not return explanations.
         round_index = obs.get("round_index", 1)
         max_rounds = obs.get("max_rounds", 5)
         discount = obs.get("discount", 1.0)
+        game_index = obs.get("game_index", 0)
+        quantities = obs.get("quantities", [])
         offered_self = pending.get("offer_allocation_self", [])
 
         if not offered_self:
             return {"action": "WALK", "reason": "bad_pending_offer"}
 
         value = self._calculate_value(offered_self, valuations_self)
+        best_seen = max(value, self.state.best_incoming_value_by_game.get(game_index, 0))
+        self.state.best_incoming_value_by_game[game_index] = best_seen
         discounted_batna = batna_self * (discount ** max(round_index - 1, 0))
-        progress = round_index / max(max_rounds, 1)
+        max_value = self._calculate_value(quantities, valuations_self)
+        target_value = self._target_value(max_value, batna_self, round_index, max_rounds)
 
-        if progress < 0.34:
-            threshold = discounted_batna
-        elif progress < 0.67:
-            threshold = discounted_batna * 0.8
+        if round_index >= max_rounds:
+            threshold = max(discounted_batna, best_seen * 0.92, target_value * 0.55)
+        elif round_index >= max_rounds - 1:
+            threshold = max(discounted_batna, best_seen * 0.96, target_value * 0.65)
+        elif round_index > 1:
+            threshold = max(discounted_batna, target_value * 0.78)
         else:
-            threshold = discounted_batna * 0.6
+            threshold = max(discounted_batna, target_value * 0.92)
 
         if value >= threshold:
             return {"action": "ACCEPT"}
