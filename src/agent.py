@@ -239,6 +239,51 @@ class Agent:
         surplus = max(max_value - batna_self, 0)
         return max(batna_self, int(batna_self + surplus * self._target_surplus_ratio(round_index, max_rounds)))
 
+    def _infer_opponent_style(
+        self,
+        game_index: int,
+        valuations_self: list[int],
+        max_value: int,
+    ) -> str:
+        history = self.state.incoming_offers_to_self_by_game.get(game_index, [])
+        if len(history) < 2:
+            return "unknown"
+
+        recent = history[-4:]
+        unique_recent = len({tuple(offer) for offer in recent})
+        recent_values = [self._calculate_value(offer, valuations_self) for offer in recent]
+        value_span = max(recent_values) - min(recent_values)
+
+        if unique_recent <= 2 and value_span <= max(2, int(max_value * 0.08)):
+            return "tough"
+        if value_span >= max(4, int(max_value * 0.18)):
+            return "flexible"
+        return "steady"
+
+    def _fairness_adjustment(
+        self,
+        my_value: int,
+        total_value: int,
+        their_proxy: int,
+        target_value: int,
+        opponent_style: str,
+    ) -> float:
+        total_value = max(total_value, 1)
+        my_share = my_value / total_value
+        their_share = their_proxy / total_value
+        fairness_penalty = max(my_share - 0.68, 0.0) * 120.0
+        fairness_penalty += max(0.16 - their_share, 0.0) * 80.0
+        fairness_penalty += max(my_value - target_value, 0) * 0.03
+
+        if opponent_style in {"tough", "steady"}:
+            fairness_penalty *= 1.25
+
+        closeability_bonus = min(their_share, 0.40) * 30.0
+        if opponent_style in {"tough", "steady"}:
+            closeability_bonus += min(their_share, 0.35) * 20.0
+
+        return closeability_bonus - fairness_penalty
+
     def _prepare_context(self, obs: dict[str, Any]) -> str:
         quantities = obs.get("quantities", [])
         valuations_self = obs.get("valuations_self", [])
@@ -292,6 +337,7 @@ Do not return explanations.
         round_index: int,
         max_rounds: int,
         previous_offer_to_other: list[int] | None = None,
+        opponent_style: str = "unknown",
     ) -> float:
         my_value = self._calculate_value(allocation_self, valuations_self)
         if my_value < batna_self:
@@ -306,6 +352,13 @@ Do not return explanations.
         target_value = self._target_value(total_value, batna_self, round_index, max_rounds)
         closeness_penalty = abs(my_value - target_value) * 0.06
         nash_proxy = my_surplus * (their_proxy + 1)
+        fairness_adjustment = self._fairness_adjustment(
+            my_value,
+            total_value,
+            their_proxy,
+            target_value,
+            opponent_style,
+        )
         extreme_penalty = 0.0
         if all(x == 0 for x in allocation_self) or all(x == 0 for x in allocation_other):
             extreme_penalty += 200.0
@@ -322,7 +375,14 @@ Do not return explanations.
             )
             concession_penalty = 0.75 * give_back + 0.2 * abrupt_concession
 
-        return nash_proxy + 0.25 * my_value - closeness_penalty - concession_penalty - extreme_penalty
+        return (
+            nash_proxy
+            + 0.22 * my_value
+            + fairness_adjustment
+            - closeness_penalty
+            - concession_penalty
+            - extreme_penalty
+        )
 
     def _best_catalog_option(
         self,
@@ -333,6 +393,7 @@ Do not return explanations.
         round_index: int,
         max_rounds: int,
         previous_offer_to_other: list[int] | None = None,
+        opponent_style: str = "unknown",
     ) -> dict[str, Any] | None:
         best_option = None
         best_score = float("-inf")
@@ -364,6 +425,7 @@ Do not return explanations.
                 round_index,
                 max_rounds,
                 previous_offer_to_other=previous_offer_to_other,
+                opponent_style=opponent_style,
             )
             if score > best_score:
                 best_score = score
@@ -407,6 +469,7 @@ Do not return explanations.
         round_index: int,
         max_rounds: int,
         best_incoming_value: int = 0,
+        opponent_style: str = "unknown",
     ) -> dict[str, Any] | None:
         if not scored_options:
             return None
@@ -414,7 +477,11 @@ Do not return explanations.
         if round_index < max_rounds - 1:
             return None
 
-        close_floor = max(batna_self, int(best_incoming_value * 1.02))
+        few_options = len(scored_options) <= 3
+        floor_multiplier = 1.02
+        if opponent_style in {"tough", "steady"} or few_options:
+            floor_multiplier = 1.00
+        close_floor = max(batna_self, int(best_incoming_value * floor_multiplier))
         best_close = None
         best_close_score = float("-inf")
         for option in scored_options:
@@ -439,7 +506,18 @@ Do not return explanations.
                 round_index,
                 max_rounds,
             )
-            close_score = their_proxy * 0.8 - abs(my_value - target_value) * 0.04 + option["score"] * 0.2
+            fairness_adjustment = self._fairness_adjustment(
+                my_value,
+                self._calculate_value(
+                    [a + b for a, b in zip(option["allocation_self"], option["allocation_other"])],
+                    valuations_self,
+                ),
+                their_proxy,
+                target_value,
+                opponent_style,
+            )
+            close_score = their_proxy * 0.9 - abs(my_value - target_value) * 0.03 + option["score"] * 0.18
+            close_score += fairness_adjustment * 0.7
             if close_score > best_close_score:
                 best_close_score = close_score
                 best_close = option
@@ -538,6 +616,7 @@ Do not return explanations.
         discounted_batna = batna_self * (discount ** max(round_index - 1, 0))
         max_value = self._calculate_value(quantities, valuations_self)
         target_value = self._target_value(max_value, batna_self, round_index, max_rounds)
+        opponent_style = self._infer_opponent_style(game_index, valuations_self, max_value)
         final_offer = self._compute_rule_based_offer(quantities, valuations_self, batna_self, max_rounds, max_rounds)
         final_offer_value = (
             self._calculate_value(final_offer[0], valuations_self) if final_offer is not None else discounted_batna
@@ -546,11 +625,16 @@ Do not return explanations.
         if round_index >= max_rounds:
             threshold = max(discounted_batna, min(best_seen, final_offer_value))
         elif round_index >= max_rounds - 1:
-            threshold = max(discounted_batna, best_seen * 0.97, final_offer_value * 0.92, target_value * 0.62)
+            threshold = max(discounted_batna, best_seen * 0.96, final_offer_value * 0.88, target_value * 0.58)
         elif round_index > 1:
             threshold = max(discounted_batna, target_value * 0.78)
         else:
             threshold = max(discounted_batna, target_value * 0.92)
+
+        if opponent_style in {"tough", "steady"} and round_index >= max_rounds - 1:
+            threshold = min(threshold, max(discounted_batna, best_seen * 0.99, target_value * 0.54))
+        if round_index >= max_rounds - 1 and value >= best_seen and value >= discounted_batna:
+            threshold = min(threshold, value)
 
         if value >= threshold:
             return {"action": "ACCEPT"}
@@ -568,6 +652,8 @@ Do not return explanations.
         previous_offers = self.state.offers_to_other_by_game.get(game_index, [])
         previous_offer_to_other = previous_offers[-1] if previous_offers else None
         best_incoming_value = self.state.best_incoming_value_by_game.get(game_index, 0)
+        max_value = self._calculate_value(quantities, valuations_self)
+        opponent_style = self._infer_opponent_style(game_index, valuations_self, max_value)
 
         best_catalog = None
         top_options: list[dict[str, Any]] = []
@@ -583,6 +669,7 @@ Do not return explanations.
                     round_index,
                     max_rounds,
                     previous_offer_to_other=previous_offer_to_other,
+                    opponent_style=opponent_style,
                 )
                 if best is not None:
                     scored.append(best)
@@ -597,10 +684,12 @@ Do not return explanations.
                     round_index,
                     max_rounds,
                     best_incoming_value=best_incoming_value,
+                    opponent_style=opponent_style,
                 )
                 logger.warning(
-                    "Catalog parsed with %s valid options; best_choice_id=%s best_score=%.2f",
+                    "Catalog parsed with %s valid options; style=%s best_choice_id=%s best_score=%.2f",
                     len(scored),
+                    opponent_style,
                     best_catalog.get("choice_id"),
                     best_catalog.get("score", float("-inf")),
                 )
