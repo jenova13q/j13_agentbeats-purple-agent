@@ -61,6 +61,17 @@ def _uses_max_completion_tokens(model: str) -> bool:
     )
 
 
+def _supports_custom_temperature(model: str) -> bool:
+    lowered = (model or "").lower()
+    return not (
+        lowered.startswith("gpt-5")
+        or lowered.startswith("gpt-5.")
+        or lowered.startswith("o1")
+        or lowered.startswith("o3")
+        or lowered.startswith("o4")
+    )
+
+
 @dataclass
 class NegotiationState:
     offers_to_other_by_game: dict[int, list[list[int]]] = field(default_factory=dict)
@@ -452,12 +463,13 @@ Do not return explanations.
                 user_prompt = self._prepare_catalog_context(obs, catalog, top_options)
             request_kwargs = {
                 "model": self.model,
-                "temperature": 0.2,
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
             }
+            if _supports_custom_temperature(self.model):
+                request_kwargs["temperature"] = 0.2
             if _uses_max_completion_tokens(self.model):
                 request_kwargs["max_completion_tokens"] = 300
             else:
